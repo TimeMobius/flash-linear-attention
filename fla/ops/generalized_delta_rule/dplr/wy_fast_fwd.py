@@ -398,12 +398,10 @@ def prepare_wy_repr_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BC = min(BT, 32)
-    if safe_gate:
-        if BT not in (16, 32, 64):
-            raise ValueError(f"the safe-gate inversion supports chunk_size 16/32/64, got {BT}")
-        fwd_fn = prepare_wy_repr_fwd_kernel_safe
-    else:
-        fwd_fn = prepare_wy_repr_fwd_kernel_chunk64 if BT == 64 else prepare_wy_repr_fwd_kernel_chunk32
+    # `safe_gate` selects the numerically centered A-stage, but the WY inverse
+    # still needs the generic path: the tensor-core shortcut rounds every
+    # intermediate to fp16 and can lose substantial accuracy on RWKV inputs.
+    fwd_fn = prepare_wy_repr_fwd_kernel_chunk64 if BT == 64 else prepare_wy_repr_fwd_kernel_chunk32
     A_ab_inv = torch.empty_like(A_ab)
     fwd_fn[(NT, B * H)](
         A_ab=A_ab,
