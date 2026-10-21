@@ -43,13 +43,74 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from fla.ops.cp import build_cp_context
+from fla.ops.cp.chunk_delta_h import pre_process_fwd_kernel_merged
 from fla.ops.generalized_delta_rule.dplr import chunk_dplr_delta_rule
 from fla.ops.generalized_delta_rule.dplr.backends import DPLRTileLangBackend
+from fla.ops.generalized_delta_rule.dplr.chunk_h_fwd import chunk_dplr_fwd_h
 from fla.ops.generalized_delta_rule.dplr.naive import dplr_recurrence
-from fla.utils import assert_close
+from fla.utils import assert_close, device
 
 # Configure logging to see assert_close messages
 logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+
+@pytest.mark.parametrize('varlen', [False, True], ids=['dense', 'varlen'])
+@pytest.mark.parametrize(('K', 'V', 'dtype'), [
+    pytest.param(64, 64, torch.bfloat16, id='K64-V64-bf16'),
+    pytest.param(128, 64, torch.bfloat16, id='K128-V64-bf16'),
+    pytest.param(192, 64, torch.bfloat16, id='K192-V64-bf16'),
+    pytest.param(256, 64, torch.bfloat16, id='K256-V64-bf16'),
+    pytest.param(64, 32, torch.float16, id='K64-V32-fp16'),
+    pytest.param(64, 96, torch.float16, id='K64-V96-fp16'),
+])
+def test_cp_dplr_prefix_state(K: int, V: int, dtype: torch.dtype, varlen: bool):
+    """CP's zero-initialized prefix state matches the ordinary DPLR state kernel."""
+    torch.manual_seed(42)
+    B, T, H, BT = 1, 192, 2, 64
+    shape = (B, T, H, K)
+    kg = torch.randn(shape, device=device, dtype=dtype) * (0.2 / K**0.5)
+    bg = torch.randn_like(kg) * (0.2 / K**0.5)
+    w = torch.randn_like(kg) * (0.1 / K**0.5)
+    v = torch.randn(B, T, H, V, device=device, dtype=dtype)
+    u = torch.randn_like(v)
+    gk = (-0.01 * torch.rand(shape, device=device)).view(B, T // BT, BT, H, K).cumsum(2).view(shape)
+    cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.long) if varlen else None
+    _, _, expected = chunk_dplr_fwd_h(
+        kg=kg,
+        v=v,
+        w=w,
+        u=u,
+        bg=bg,
+        gk=gk,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        chunk_size=BT,
+    )
+    hm = torch.full((H, K, V + K), float('nan'), device=device, dtype=torch.float32)
+    block_size = 32 if K <= 64 else 64
+    pre_process_fwd_kernel_merged[((V + block_size - 1) // block_size, H)](
+        k=kg,
+        v=v,
+        w=w,
+        g=None,
+        gk=gk,
+        bg=bg,
+        u=u,
+        hm=hm,
+        cu_seqlens=cu_seqlens,
+        T=T,
+        H=H,
+        HV=H,
+        K=K,
+        V=V,
+        BT=BT,
+        BLOCK_SIZE=block_size,
+        BK1=K if K != 192 else 256,
+        MULTI_SEQS=False,
+    )
+    actual = hm[..., :V].unsqueeze(0)
+    assert torch.isfinite(actual).all()
+    assert_close('prefix state', expected, actual, ratio=5e-5, warning=False)
 
 
 def init_distributed(rank, world_size):

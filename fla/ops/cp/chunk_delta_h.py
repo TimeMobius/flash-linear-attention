@@ -195,7 +195,9 @@ def pre_process_fwd_kernel_merged(
                     o_k4 = 192 + o_k1
                     b_gk_last4 = tl.load(p_gk_last + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
                     b_h4 *= exp2(b_gk_last4)[:, None]
-            b_v = b_v.to(k.dtype.element_ty)
+            # match the ordinary DPLR state kernel's fp32 v2 in the bg update
+            if not USE_BG:
+                b_v = b_v.to(k.dtype.element_ty)
 
             # Update h
             p_k = k + o_k1[:, None] + o_t[None, :] * stride_k
@@ -204,25 +206,25 @@ def pre_process_fwd_kernel_merged(
                 # DPLR mode: h += kg^T @ v + bg^T @ v2
                 p_bg = bg + o_k1[:, None] + o_t[None, :] * stride_k
                 b_bg = tl.load(p_bg, mask=m_k1[:, None] & m_t[None, :], other=0.0)
-                b_h1 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+                b_h1 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg.to(tl.float32), b_v)
                 if K > 64:
                     p_k = k + o_k2[:, None] + o_t[None, :] * stride_k
                     b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
                     p_bg = bg + o_k2[:, None] + o_t[None, :] * stride_k
                     b_bg = tl.load(p_bg, mask=m_k2[:, None] & m_t[None, :], other=0.0)
-                    b_h2 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+                    b_h2 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg.to(tl.float32), b_v)
                 if K > 128:
                     p_k = k + o_k3[:, None] + o_t[None, :] * stride_k
                     b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
                     p_bg = bg + o_k3[:, None] + o_t[None, :] * stride_k
                     b_bg = tl.load(p_bg, mask=m_k3[:, None] & m_t[None, :], other=0.0)
-                    b_h3 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+                    b_h3 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg.to(tl.float32), b_v)
                 if K > 192:
                     p_k = k + o_k4[:, None] + o_t[None, :] * stride_k
                     b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
                     p_bg = bg + o_k4[:, None] + o_t[None, :] * stride_k
                     b_bg = tl.load(p_bg, mask=m_k4[:, None] & m_t[None, :], other=0.0)
-                    b_h4 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+                    b_h4 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg.to(tl.float32), b_v)
             else:
                 # GDN/KDA mode: h += k^T @ v_new
                 b_h1 = tl.dot(b_k, b_v, b_h1)
