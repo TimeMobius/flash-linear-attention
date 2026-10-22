@@ -21,7 +21,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class FLACPContext:
-    """FLA Context Parallel Context - Operator-level context management."""
+    """FLA Context Parallel Context - Operator-level context management.
+
+    DPLR can opt into ``dplr_state_mode='recurrent'`` to transport native FP32
+    states in rank order, preserving the ordinary kernel's operand rounding.
+    This mode requires a contiguous layout and introduces serial state dependencies.
+    """
     group: ProcessGroup | None = None
     cu_seqlens: torch.Tensor | None = None
     cu_seqlens_cpu: torch.Tensor | None = None
@@ -47,6 +52,8 @@ class FLACPContext:
     is_first_by_part: tuple[bool, bool] | None = None
     is_last_by_part: tuple[bool, bool] | None = None
     pre_num_conv_tokens_by_part: tuple[int, int] | None = None
+    # DPLR's recurrent mode preserves the ordinary kernel's state-rounding order.
+    dplr_state_mode: str = 'affine'
 
     def copy_for_backward(self) -> FLACPContext:
         """Create a copy for backward pass (useful when PP_SIZE > 1)."""
@@ -71,6 +78,7 @@ class FLACPContext:
             is_first_by_part=self.is_first_by_part,
             is_last_by_part=self.is_last_by_part,
             pre_num_conv_tokens_by_part=self.pre_num_conv_tokens_by_part,
+            dplr_state_mode=self.dplr_state_mode,
         )
 
     @property

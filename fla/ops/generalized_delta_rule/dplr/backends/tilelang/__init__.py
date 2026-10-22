@@ -63,6 +63,10 @@ class DPLRTileLangBackend(BaseBackend):
             # rejected so the default implementation surfaces the ValueError
             return False, "TileLang backend requires `lower_bound < 0`; fall back to Triton"
         if cp_context is not None:
+            if getattr(cp_context, 'dplr_state_mode', 'affine') == 'recurrent':
+                return False, "DPLR recurrent CP state transport requires the Triton state kernels; fall back to Triton"
+            if getattr(cp_context, 'dplr_state_mode', 'affine') != 'affine':
+                return False, "TileLang DPLR requires dplr_state_mode='affine'; fall back to Triton"
             if initial_state is not None:
                 return False, "TileLang backend does not support initial_state with CP; fall back to Triton"
             if output_final_state:

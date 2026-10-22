@@ -23,6 +23,7 @@ from fla.ops.generalized_delta_rule.dplr.chunk_h_bwd import chunk_dplr_bwd_dhu
 from fla.ops.generalized_delta_rule.dplr.chunk_h_fwd import chunk_dplr_fwd_h
 from fla.ops.generalized_delta_rule.dplr.chunk_o_bwd import chunk_dplr_bwd_dAu, chunk_dplr_bwd_dv, chunk_dplr_bwd_o
 from fla.ops.generalized_delta_rule.dplr.chunk_o_fwd import chunk_dplr_fwd_o
+from fla.ops.generalized_delta_rule.dplr.context_parallel import receive_recurrent_state, send_recurrent_state
 from fla.ops.generalized_delta_rule.dplr.wy_fast_bwd import chunk_dplr_bwd_wy
 from fla.ops.generalized_delta_rule.dplr.wy_fast_fwd import prepare_wy_repr_fwd
 from fla.ops.rwkv6.chunk import chunk_rwkv6_fwd_cumsum
@@ -97,7 +98,11 @@ def chunk_dplr_fwd(
         safe_gate=safe_gate,
     )
 
-    if cp_context is not None:
+    recurrent_cp = cp_context is not None and cp_context.dplr_state_mode == 'recurrent'
+    if recurrent_cp:
+        initial_state = k.new_zeros(cp_context.num_seqs, *k.shape[2:], v.shape[-1], dtype=torch.float32)
+        initial_state = receive_recurrent_state(context=cp_context, state=initial_state)
+    elif cp_context is not None:
         initial_state = chunk_gated_delta_rule_fwd_h_pre_process(
             k=kg,
             w=w,
@@ -119,11 +124,16 @@ def chunk_dplr_fwd(
         u=u,
         gk=gi,
         initial_state=initial_state,
-        output_final_state=output_final_state,
+        output_final_state=output_final_state or (recurrent_cp and not cp_context.is_last_rank),
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
     )
+
+    if recurrent_cp:
+        if not cp_context.is_last_rank:
+            send_recurrent_state(context=cp_context, state=final_state)
+        final_state = None
 
     if cp_context is not None:
         initial_state = compress_h0(initial_state, context=cp_context)
@@ -192,7 +202,7 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
         if cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu)
 
-        # chunk_dplr_fwd returns the possibly CP-merged + compressed initial_state;
+        # chunk_dplr_fwd returns the resolved and compressed CP initial_state;
         # for CP this is the [1, HV, K, V] state we must save for backward so the
         # forward recomputation can rebuild the correct per-rank h.
         o, final_state, initial_state, cache = chunk_dplr_fwd(
@@ -355,7 +365,10 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
             chunk_indices=ctx.chunk_indices,
         )
 
-        if cp_context is not None:
+        recurrent_cp = cp_context is not None and cp_context.dplr_state_mode == 'recurrent'
+        if recurrent_cp:
+            dht = receive_recurrent_state(context=cp_context, state=torch.zeros_like(initial_state), backward=True)
+        elif cp_context is not None:
             dht, initial_state = chunk_gated_delta_rule_bwd_dhu_pre_process(
                 q=qg,
                 k=kg,
@@ -385,6 +398,9 @@ class ChunkDPLRDeltaRuleFunction(torch.autograd.Function):
             chunk_size=chunk_size,
             chunk_indices=ctx.chunk_indices,
         )
+        if recurrent_cp:
+            send_recurrent_state(context=cp_context, state=dh0, backward=True)
+            dh0 = None
 
         dv = chunk_dplr_bwd_dv(
             A_qk=A_qk,
@@ -520,6 +536,8 @@ def chunk_dplr_delta_rule(
         cp_context (Optional[FLACPContext]):
             Context parallel context for distributed training across multiple devices.
             When provided, `initial_state` and `output_final_state` are not supported.
+            Set `cp_context.dplr_state_mode='recurrent'` for native state transport
+            with serial state dependencies in contiguous CP layouts.
             Default: `None`.
         lower_bound (Optional[float]):
             When set, asserts `lower_bound <= gk < 0` (the caller is responsible for
@@ -546,6 +564,11 @@ def chunk_dplr_delta_rule(
     if lower_bound is not None and lower_bound >= 0:
         raise ValueError(f"`lower_bound` must be negative (gk is a log-decay < 0), got {lower_bound}.")
     if cp_context is not None:
+        if cp_context.dplr_state_mode not in ('affine', 'recurrent'):
+            raise ValueError(f"Unknown DPLR CP state mode: {cp_context.dplr_state_mode!r}.")
+        if cp_context.dplr_state_mode == 'recurrent':
+            if cp_context.layout != 'contiguous' or cp_context.group is None:
+                raise ValueError("DPLR recurrent CP state transport requires a contiguous layout and a process group.")
         assert initial_state is None, "Initial state is not supported for CP"
         assert output_final_state is False, "Output final state is not supported for CP"
         assert cp_context.cu_seqlens is not None, "cu_seqlens is required for CP"
